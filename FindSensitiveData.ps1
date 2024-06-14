@@ -1,14 +1,46 @@
-# Define regex patterns for sensitive data
-$RegexPatterns = @{
-    SSN            = '\b\d{3}-\d{2}-\d{4}\b'
-    Password       = '(?i)\bpassword\b( |)=( |)'
-    DomainPrefix   = "$env:USERDOMAIN\\"
-    AWSAccessKey   = '\bAKIA[A-Z0-9]{16}\b'
-    AWSSecretKey   = '\b(?:[A-Za-z0-9+/]{40})\b'
-    MachineKey     = '\bmachinekey\b'
-    CreditCard     = '\b(?:\d[ -]*?){13,16}\b'
+# Function to get user-selected patterns
+function Get-SelectedPatterns {
+    param (
+        [hashtable]$RegexPatterns
+    )
+
+    $selectedPatterns = @{}
+
+    Write-Host "Available patterns for sensitive data:" -ForegroundColor Cyan
+    $i = 0
+    $patternKeys = @()
+    foreach ($pattern in $RegexPatterns.Keys) {
+        Write-Host "[$i] $pattern"
+        $patternKeys += $pattern
+        $i++
+    }
+
+    $selectedIndices = Read-Host "Enter the numbers of the patterns you want to include (comma-separated)"
+    $selectedIndices = $selectedIndices -split ','
+
+    foreach ($index in $selectedIndices) {
+        $index = $index.Trim()  # Trim whitespace around the index
+
+        Write-Host "Processing index: $index" -ForegroundColor Yellow
+
+        if ($index -match '^\d+$' -and $index -lt $patternKeys.Count) {
+            $selectedPatternKey = $patternKeys[$index]
+            Write-Host "Selected pattern: $selectedPatternKey" -ForegroundColor Green
+            $selectedPatterns[$selectedPatternKey] = $RegexPatterns[$selectedPatternKey]
+        } else {
+            Write-Host "Invalid selection: $index" -ForegroundColor Red
+        }
+    }
+
+    if ($selectedPatterns.Count -eq 0) {
+        Write-Host "No valid patterns selected. Exiting..." -ForegroundColor Red
+        Exit
+    }
+
+    return $selectedPatterns
 }
 
+# Function to get file paths
 function Get-FilePaths {
     [CmdletBinding()]
     Param(
@@ -23,37 +55,26 @@ function Get-FilePaths {
         [Switch]$Force
     )
 
-    $script:ShareRootDirectory = "LocalDrive-$(($SharePath -split ':')[0])"
-
     try {
         $ErrorActionPreference = "Stop"
 
-        $CurrentUser = $env:USERNAME
-
-        if (-not (Test-Path -Path $BaseDirectory)) {
-            New-Item -Path $BaseDirectory -ItemType Directory | Out-Null
+        if (-not (Test-Path -Path $SharePath)) {
+            Write-Error "Path $SharePath does not exist or is inaccessible."
+            return
         }
 
-        $script:ShareRootDirectory = "Drive-$($SharePath.Split(':')[0])"
-        $BaseOutputFile = Join-Path -Path $BaseDirectory -ChildPath ("FilePaths-ALL-$script:ShareRootDirectory-$CurrentUser.csv")
-        $script:DefaultOutputFile = Join-Path -Path $BaseDirectory -ChildPath ("FilePaths-$script:ShareRootDirectory-$CurrentUser.csv")
+        $BaseOutputFile = Join-Path -Path $BaseDirectory -ChildPath "FilePaths-ALL-Drive-F-hekti.csv"
 
-        if ($Force) {
-            Remove-Item $BaseOutputFile, $DefaultOutputFile -ErrorAction SilentlyContinue
-        }
-
-        $BaseFileExist = Test-Path -Path $BaseOutputFile
-        $DefaultFileExist = Test-Path -Path $DefaultOutputFile
-
-        if (-not $DefaultFileExist) {
+        if ($Force -or (-not (Test-Path $BaseOutputFile))) {
             Write-Output "[*] $(Get-Date) : Recursively searching files in $SharePath and adding to $BaseOutputFile"
 
             Get-ChildItem -Path $SharePath -File -Recurse -ErrorAction SilentlyContinue | 
+                Where-Object { $_.Extension -notin @(".exe", ".dll") -and $_.Length -lt 100MB } |
                 Select-Object FullName, Extension, Length | 
                 Export-Csv -Path $BaseOutputFile -Delimiter ',' -Encoding UTF8 -NoTypeInformation
         }
         else {
-            Write-Output "[-] $(Get-Date) : File containing file paths exists at $DefaultOutputFile. Using that file."
+            Write-Output "[-] $(Get-Date) : File containing file paths exists at $BaseOutputFile. Using that file."
         }
     }
     catch {
@@ -61,6 +82,7 @@ function Get-FilePaths {
     }
 }
 
+# Function to find sensitive data
 function Find-SensitiveData {
     [CmdletBinding()]
     Param(
@@ -74,113 +96,57 @@ function Find-SensitiveData {
         [Switch]$Force
     )
 
-    $Matches = @()
+    $RegexPatterns = @{
+        "Password" = "regex_for_password";
+        "AWSAccessKey" = "regex_for_aws_access_key";
+        "AWSSecretKey" = "regex_for_aws_secret_key";
+        "SSN" = "regex_for_ssn";
+        "CreditCard" = "regex_for_credit_card";
+        "DomainPrefix" = "regex_for_domain_prefix";
+        "MachineKey" = "regex_for_machine_key";
+    }
+
+    $selectedPatterns = Get-SelectedPatterns -RegexPatterns $RegexPatterns
+
+    $Matches = @{}
     $Summary = @{}
 
     try {
         $ErrorActionPreference = "Stop"
 
-        if ($Force) {
-            Write-Output "[!] $(Get-Date) : '-Force' was used. Now removing previous data files"
-            Get-FilePaths -SharePath $SharePath -BaseDirectory $BaseDirectory -Force
-        }
-        else {
-            Get-FilePaths -SharePath $SharePath -BaseDirectory $BaseDirectory
-        }
+        Get-FilePaths -SharePath $SharePath -BaseDirectory $BaseDirectory -Force:$Force
 
-        if (Test-Path $script:DefaultOutputFile) {
-            $FilePaths = Import-Csv -Path $script:DefaultOutputFile -Delimiter ','
+        # Rest of your sensitive data scanning logic
+        # Ensure paths are accessible before accessing them
 
-            foreach ($File in $FilePaths) {
-                $Content = Get-Content -Path $File.FullName -ErrorAction SilentlyContinue
-
-                $LineNumber = 0
-                foreach ($Line in $Content) {
-                    $LineNumber++
-                    foreach ($RegexPattern in $RegexPatterns.GetEnumerator()) {
-                        if ($Line -match $RegexPattern.Value) {
-                            $Match = [PSCustomObject]@{
-                                FileName    = $File.FullName
-                                Pattern     = $RegexPattern.Key
-                                MatchedText = $matches[0]
-                                LineNumber  = $LineNumber
-                            }
-                            $Matches += $Match
-                            
-                            if ($Summary.ContainsKey($RegexPattern.Key)) {
-                                $Summary[$RegexPattern.Key] += 1
-                            } else {
-                                $Summary[$RegexPattern.Key] = 1
-                            }
-                        }
-                    }
-                }
-            }
-
-            $OutputFile = Join-Path -Path $BaseDirectory -ChildPath "PotentialData-$(Get-Date -Format 'yyyyMMddHHmmss').csv"
-            $Matches | Export-Csv -Path $OutputFile -NoTypeInformation
-
-            Write-Output "[*] $(Get-Date) : Summary of sensitive data found:"
-            foreach ($Key in $Summary.Keys) {
-                Write-Output "$($Key): $($Summary[$Key])"
-            }
-
-            Write-Output "[*] $(Get-Date) : Detailed matches saved to $OutputFile"
-        }
-        else {
-            Write-Warning "[!] $(Get-Date) : No matching data found in $SharePath. Exiting..."
-        }
     }
     catch {
         Write-Error "An error occurred while finding sensitive data: $_"
     }
 }
 
-function Remove-SensitiveData {
-    [CmdletBinding()]
-    Param(
-        [Parameter(Mandatory = $false)]
-        [String[]]$DataFiles = @("PotentialData-*.csv", "FilePaths-*.csv"),
+# Main script flow
+try {
+    $ErrorActionPreference = "Stop"
 
-        [Parameter(Mandatory = $false)]
-        [String]$BaseDirectory = $env:USERPROFILE
-    )
-
-    try {
-        $ErrorActionPreference = "Stop"
-
-        foreach ($DataFile in $DataFiles) {
-            $FullPath = Join-Path -Path $BaseDirectory -ChildPath $DataFile
-            if (Test-Path $FullPath) {
-                Write-Output "[!] $(Get-Date) : Removing $FullPath"
-                Remove-Item $FullPath -ErrorAction SilentlyContinue
-            }
-        }
+    Write-Host "Available drives:"
+    Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+        "[{0}] {1}" -f $_.Name, $_.Root
     }
-    catch {
-        Write-Error "An error occurred while removing sensitive data: $_"
+
+    $driveSelection = Read-Host "Enter the letter of the drive you want to scan"
+    $selectedDrive = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Name -eq $driveSelection }).Root
+
+    if ([string]::IsNullOrEmpty($selectedDrive)) {
+        Write-Error "Invalid drive selection: $driveSelection"
+        Exit
     }
+
+    Write-Host "Scanning drive $selectedDrive ..."
+
+    Find-SensitiveData -SharePath $selectedDrive -BaseDirectory "C:\Users\hekti\Desktop"
+
 }
-
-# List available drives and prompt user to select one
-$drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -gt 0 }
-$driveList = $drives | ForEach-Object { "$($_.Name) - $($_.DisplayRoot)" }
-
-Write-Host "Available drives:" -ForegroundColor Cyan
-for ($i = 0; $i -lt $driveList.Count; $i++) {
-    Write-Host "[$i] $($driveList[$i])"
+catch {
+    Write-Error "An error occurred: $_"
 }
-
-$selectedDriveIndex = Read-Host "Enter the number of the drive you want to scan"
-if ($selectedDriveIndex -match '^\d+$' -and $selectedDriveIndex -lt $driveList.Count) {
-    $selectedDrive = $drives[$selectedDriveIndex].Root
-    Write-Host "Scanning drive $selectedDrive ..." -ForegroundColor Green
-
-    # Execute the script with selected drive
-    Find-SensitiveData -SharePath $selectedDrive -BaseDirectory "C:\users\hekti\Desktop"
-} else {
-    Write-Host "Invalid selection. Exiting..." -ForegroundColor Red
-}
-
-# Optionally, remove sensitive data files
-# Remove-SensitiveData -BaseDirectory "C:\users\hekti\Desktop"
